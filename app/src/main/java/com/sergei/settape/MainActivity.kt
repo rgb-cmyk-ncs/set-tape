@@ -27,8 +27,10 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import com.sergei.settape.audio.Db
+import com.sergei.settape.audio.Gain
 import com.sergei.settape.audio.Pipeline
 import java.io.File
+import java.util.Locale
 
 /** The whole app is this one screen: levels, the record button, a few settings and the recordings. */
 class MainActivity : Activity(), Engine.Listener {
@@ -42,6 +44,10 @@ class MainActivity : Activity(), Engine.Listener {
     private var frame = 0
     private var askedForPermission = false
     private var resumed = false
+    /** Sent to the airplane mode setting to switch it on; start the take on the way back. */
+    private var startAfterAirplane = false
+
+    private lateinit var airplaneView: TextView
 
     private lateinit var statusView: TextView
     private lateinit var timerView: TextView
@@ -104,6 +110,10 @@ class MainActivity : Activity(), Engine.Listener {
             openInput()
         } else if (!askedForPermission) {
             askForPermissions()
+        }
+        if (startAfterAirplane) {
+            startAfterAirplane = false
+            if (isAirplaneOn() && hasMicPermission() && !Engine.busy) startTake()
         }
         refreshState()
         refreshRecordings()
@@ -170,9 +180,58 @@ class MainActivity : Activity(), Engine.Listener {
             }
             return
         }
+        if (Engine.busy) {
+            val wasRecording = Engine.state == Engine.State.RECORDING
+            Engine.toggle(this)
+            refreshState()
+            if (wasRecording && isAirplaneOn()) askAirplaneOff()
+            return
+        }
+        if (isAirplaneOn()) startTake() else askAirplaneOn()
+    }
+
+    private fun startTake() {
         Engine.toggle(this)
         if (Engine.state != Engine.State.IDLE) RecorderService.start(this)
         refreshState()
+    }
+
+    // ---- airplane mode: the phone's radio buzzes into the line ----
+
+    private fun isAirplaneOn(): Boolean =
+        try { Settings.Global.getInt(contentResolver, Settings.Global.AIRPLANE_MODE_ON, 0) == 1 } catch (e: Exception) { false }
+
+    /** Android doesn't let apps flip airplane mode, so open the switch for the user. */
+    private fun openAirplaneSettings(): Boolean {
+        for (action in listOf(Settings.ACTION_AIRPLANE_MODE_SETTINGS, Settings.ACTION_WIRELESS_SETTINGS, Settings.ACTION_SETTINGS)) {
+            try {
+                startActivity(Intent(action))
+                return true
+            } catch (e: Exception) { }
+        }
+        return false
+    }
+
+    private fun askAirplaneOn() {
+        AlertDialog.Builder(this)
+            .setTitle("Airplane mode is off")
+            .setMessage("The phone's signal can buzz into the recording. Switch airplane mode on, then come back: recording starts by itself.")
+            .setPositiveButton("Turn on") { _, _ ->
+                startAfterAirplane = openAirplaneSettings()
+                if (!startAfterAirplane) startTake()
+            }
+            .setNeutralButton("Record anyway") { _, _ -> startTake() }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun askAirplaneOff() {
+        AlertDialog.Builder(this)
+            .setTitle("Recording saved")
+            .setMessage("Switch airplane mode off again?")
+            .setPositiveButton("Turn off") { _, _ -> openAirplaneSettings() }
+            .setNegativeButton("Later", null)
+            .show()
     }
 
     // ---- engine callbacks ----
@@ -267,6 +326,9 @@ class MainActivity : Activity(), Engine.Listener {
     private fun refreshLive() {
         val state = Engine.state
         timerView.text = Recordings.clock(if (state == Engine.State.RECORDING) Engine.takeSeconds else 0)
+
+        val warnAirplane = Engine.busy && !isAirplaneOn()
+        airplaneView.visibility = if (warnAirplane) View.VISIBLE else View.GONE
 
         val message = Engine.lastMessage
         val perSecond = Engine.bytesPerSecond
@@ -373,7 +435,7 @@ class MainActivity : Activity(), Engine.Listener {
     private fun recordingMenu(item: Recordings.Item) {
         AlertDialog.Builder(this)
             .setTitle(item.title)
-            .setItems(arrayOf("Play", "Share", "Delete")) { _, which ->
+            .setItems(arrayOf("Play", "Share", "Volume", "Delete")) { _, which ->
                 when (which) {
                     0 -> withUri(item.file) { uri ->
                         launch(Intent(Intent.ACTION_VIEW).setDataAndType(uri, WAV).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
@@ -383,7 +445,8 @@ class MainActivity : Activity(), Engine.Listener {
                             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         launch(Intent.createChooser(send, "Share recording"))
                     }
-                    2 -> AlertDialog.Builder(this)
+                    2 -> volumeMenu(item)
+                    3 -> AlertDialog.Builder(this)
                         .setMessage("Delete ${item.title}? This can't be undone.")
                         .setPositiveButton("Delete") { _, _ ->
                             if (!item.file.delete()) toast("Android would not let the app delete this file.")
@@ -392,6 +455,38 @@ class MainActivity : Activity(), Engine.Listener {
                         }
                         .setNegativeButton("Cancel", null)
                         .show()
+                }
+            }
+            .show()
+    }
+
+    /** Louder or softer afterwards. The file itself is changed, so play it again to hear it. */
+    private fun volumeMenu(item: Recordings.Item) {
+        val names = arrayOf("Normalize (loudest part to −1 dB)", "Louder +6 dB", "Louder +3 dB", "Softer −3 dB", "Softer −6 dB")
+        val steps = floatArrayOf(0f, 6f, 3f, -3f, -6f)
+        AlertDialog.Builder(this)
+            .setTitle("Volume · " + item.title)
+            .setItems(names) { _, which ->
+                toast("Changing the volume…")
+                val app = applicationContext
+                Gain.worker.execute {
+                    val text = try {
+                        val db = if (which == 0) Gain.normalize(listOf(item.file)) else Gain.change(item.file, steps[which])
+                        when {
+                            db == 0f && which == 0 -> "Already at full level."
+                            db == 0f -> "Already as loud as it can go without clipping."
+                            which != 0 && steps[which] > 0f && db < steps[which] - 0.05f ->
+                                String.format(Locale.US, "Made %+.1f dB louder: any more would clip.", db)
+                            else -> String.format(Locale.US, "Volume changed %+.1f dB.", db)
+                        }
+                    } catch (e: Exception) {
+                        "Could not change the volume: ${e.message}"
+                    }
+                    MediaScannerConnection.scanFile(app, arrayOf(item.file.absolutePath), null, null)
+                    runOnUiThread {
+                        Toast.makeText(app, text, Toast.LENGTH_LONG).show()
+                        if (!isDestroyed) refreshRecordings()
+                    }
                 }
             }
             .show()
@@ -544,6 +639,17 @@ class MainActivity : Activity(), Engine.Listener {
         sourceView = label("", 15f, Ui.TEXT)
         detailView = label("", 13f, Ui.DIM)
         root.addView(statusView)
+        airplaneView = label("AIRPLANE MODE IS OFF · phone signal can buzz into the recording. Tap to switch it on.", 14f, Ui.BG).apply {
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            background = GradientDrawable().apply {
+                setColor(Ui.AMBER)
+                cornerRadius = dp(10).toFloat()
+            }
+            visibility = View.GONE
+            setOnClickListener { openAirplaneSettings() }
+        }
+        root.addView(airplaneView, matchWrap().apply { topMargin = dp(8) })
         root.addView(timerView, matchWrap().apply { topMargin = dp(6) })
         root.addView(sourceView, matchWrap().apply { topMargin = dp(6) })
         root.addView(detailView, matchWrap().apply { topMargin = dp(2) })
@@ -658,6 +764,14 @@ class MainActivity : Activity(), Engine.Listener {
         bitsRow = row(root, "Quality") { pickBits() }
 
         root.addView(heading("RECORDINGS"), matchWrap().apply { topMargin = dp(22) })
+        root.addView(Switch(this).apply {
+            text = "Normalize after recording (loudest part to −1 dB)"
+            setTextColor(Ui.TEXT)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            minimumHeight = dp(52)
+            isChecked = prefs.normalize
+            setOnCheckedChangeListener { _, checked -> prefs.normalize = checked }
+        }, matchWrap())
         folderView = label("", 13f, Ui.DIM)
         root.addView(folderView, matchWrap().apply { bottomMargin = dp(4) })
         recordingsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }

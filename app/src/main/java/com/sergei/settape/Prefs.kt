@@ -31,6 +31,11 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("auto", false)
         set(v) = sp.edit().putBoolean("auto", v).apply()
 
+    /** Bring each finished take up to full level (loudest moment at -1 dB). */
+    var normalize: Boolean
+        get() = sp.getBoolean("normalize", true)
+        set(v) = sp.edit().putBoolean("normalize", v).apply()
+
     var thresholdDb: Int
         get() = sp.getInt("threshold", -40).coerceIn(THRESHOLD_MIN, THRESHOLD_MAX)
         set(v) = sp.edit().putInt("threshold", v).apply()

@@ -378,7 +378,28 @@ object Engine {
         }
 
         override fun onTakeFinished(files: List<File>, frames: Long) {
-            main.post {
+            val ctx0 = app
+            if (ctx0 != null && Prefs(ctx0).normalize) {
+                // Rewriting a long take takes a while, so it runs on its own thread.
+                com.sergei.settape.audio.Gain.worker.execute {
+                    val text = try {
+                        val db = com.sergei.settape.audio.Gain.normalize(files)
+                        if (db > 0f) String.format(java.util.Locale.US, "Recording normalized: +%.1f dB", db) else null
+                    } catch (e: Exception) {
+                        "Could not normalize the recording: ${e.message}"
+                    }
+                    main.post {
+                        if (text != null) for (l in listeners) l.onEngineMessage(text)
+                        finished(files)
+                    }
+                }
+            } else {
+                main.post { finished(files) }
+            }
+        }
+
+        private fun finished(files: List<File>) {
+            run {
                 val ctx = app
                 if (ctx != null) {
                     // Tell Android's media library, so the files appear in other apps straight away.

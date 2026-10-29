@@ -13,8 +13,8 @@ android {
         applicationId = "com.sergei.settape"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 3
+        versionName = "0.3"
     }
 
     // One fixed key, kept in the repo, so every build installs over the previous one
